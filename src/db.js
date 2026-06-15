@@ -76,14 +76,79 @@ function initSchema(conn) {
     CREATE INDEX IF NOT EXISTS idx_pipe_status   ON pipe_segments(status);
     CREATE INDEX IF NOT EXISTS idx_station_district ON pump_stations(district);
     CREATE INDEX IF NOT EXISTS idx_station_status   ON pump_stations(status);
+
+    -- 降雨观测记录：按区域+小时整点唯一
+    CREATE TABLE IF NOT EXISTS rainfall_records (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      district        TEXT NOT NULL,
+      timestamp       TEXT NOT NULL,
+      hour_rainfall   REAL NOT NULL DEFAULT 0,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(district, timestamp)
+    );
+
+    -- 防汛响应阈值配置：district=NULL 表示全局默认
+    -- indicator: 1h / 3h / 24h
+    -- level: blue / yellow / orange / red
+    CREATE TABLE IF NOT EXISTS flood_thresholds (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      district        TEXT,
+      indicator       TEXT NOT NULL,
+      level           TEXT NOT NULL,
+      threshold_mm    REAL NOT NULL,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(district, indicator, level)
+    );
+
+    -- 各区域当前响应等级（最新状态）
+    CREATE TABLE IF NOT EXISTS district_response_levels (
+      id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+      district                TEXT NOT NULL UNIQUE,
+      current_level           TEXT NOT NULL,
+      triggered_by_indicator  TEXT NOT NULL,
+      triggered_value         REAL NOT NULL,
+      calculated_at           TEXT NOT NULL,
+      updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- 等级变更历史
+    CREATE TABLE IF NOT EXISTS level_change_history (
+      id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+      district                TEXT NOT NULL,
+      from_level              TEXT,
+      to_level                TEXT NOT NULL,
+      changed_at              TEXT NOT NULL,
+      triggered_by_indicator  TEXT NOT NULL,
+      triggered_value         REAL NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_rainfall_district_time ON rainfall_records(district, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_thresholds_district    ON flood_thresholds(district);
+    CREATE INDEX IF NOT EXISTS idx_history_district_time  ON level_change_history(district, changed_at DESC);
   `);
 }
 
 /** 清空所有业务数据（测试用）。 */
 function resetAll() {
   const conn = getDb();
-  conn.exec('DELETE FROM pipe_segments; DELETE FROM pump_stations; DELETE FROM users;');
-  conn.exec("DELETE FROM sqlite_sequence WHERE name IN ('pipe_segments','pump_stations','users');");
+  conn.exec(`
+    DELETE FROM pipe_segments;
+    DELETE FROM pump_stations;
+    DELETE FROM users;
+    DELETE FROM rainfall_records;
+    DELETE FROM flood_thresholds;
+    DELETE FROM district_response_levels;
+    DELETE FROM level_change_history;
+  `);
+  conn.exec(`
+    DELETE FROM sqlite_sequence
+    WHERE name IN (
+      'pipe_segments','pump_stations','users',
+      'rainfall_records','flood_thresholds',
+      'district_response_levels','level_change_history'
+    );
+  `);
 }
 
 function close() {

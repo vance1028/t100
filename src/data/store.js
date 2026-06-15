@@ -252,7 +252,245 @@ function deleteStation(id) {
   return getDb().prepare('DELETE FROM pump_stations WHERE id = ?').run(id).changes > 0;
 }
 
-/* -------------------------------- 计数 -------------------------------- */
+/* ------------------------------- 降雨记录 ------------------------------- */
+
+function mapRainfallRecord(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    district: row.district,
+    timestamp: row.timestamp,
+    hourRainfall: row.hour_rainfall,
+    createdAt: row.created_at,
+  };
+}
+
+/**
+ * 批量插入降雨记录，同一区域同一小时已存在则更新雨量值。
+ * @param {Array<{district: string, timestamp: string, hourRainfall: number}>} records
+ * @returns {number} 实际处理的记录数
+ */
+function batchUpsertRainfall(records) {
+  const db = getDb();
+  const stmt = db.prepare(`
+    INSERT INTO rainfall_records (district, timestamp, hour_rainfall)
+    VALUES (@district, @timestamp, @hourRainfall)
+    ON CONFLICT(district, timestamp) DO UPDATE SET
+      hour_rainfall = excluded.hour_rainfall,
+      created_at = datetime('now')
+  `);
+
+  const tx = db.transaction((recs) => {
+    let count = 0;
+    for (const r of recs) {
+      const info = stmt.run(r);
+      count += info.changes;
+    }
+    return count;
+  });
+
+  return tx(records);
+}
+
+/**
+ * 查询某区域在时间范围内的降雨记录（按时间升序）。
+ * @param {string} district
+ * @param {string} startTime - 开始时间（含）
+ * @param {string} endTime - 结束时间（不含）
+ */
+function getRainfallByRange(district, startTime, endTime) {
+  return getDb()
+    .prepare(`
+      SELECT * FROM rainfall_records
+      WHERE district = ? AND timestamp >= ? AND timestamp < ?
+      ORDER BY timestamp ASC
+    `)
+    .all(district, startTime, endTime)
+    .map(mapRainfallRecord);
+}
+
+/**
+ * 查询某区域时间范围内的降雨记录（用于计算响应等级）。
+ * @param {string} district
+ * @param {string} startTimeStr - 开始时间（含，已格式化）
+ * @param {string} endTimeStr - 结束时间（不含，已格式化）
+ */
+function getRainfallForCalculation(district, startTimeStr, endTimeStr) {
+  return getDb()
+    .prepare(`
+      SELECT * FROM rainfall_records
+      WHERE district = ? AND timestamp >= ? AND timestamp < ?
+      ORDER BY timestamp ASC
+    `)
+    .all(district, startTimeStr, endTimeStr);
+}
+
+/* ------------------------------- 阈值配置 ------------------------------- */
+
+function mapThreshold(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    district: row.district,
+    indicator: row.indicator,
+    level: row.level,
+    thresholdMm: row.threshold_mm,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function listThresholds({ district } = {}) {
+  const where = [];
+  const params = [];
+  if (district !== undefined) {
+    if (district === null) {
+      where.push('district IS NULL');
+    } else {
+      where.push('district = ?');
+      params.push(district);
+    }
+  }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  return getDb()
+    .prepare(`SELECT * FROM flood_thresholds ${clause} ORDER BY district IS NULL, district, indicator, level`)
+    .all(...params)
+    .map(mapThreshold);
+}
+
+function getThresholdById(id) {
+  return mapThreshold(getDb().prepare('SELECT * FROM flood_thresholds WHERE id = ?').get(id));
+}
+
+function createThreshold({ district, indicator, level, thresholdMm }) {
+  const info = getDb()
+    .prepare(`
+      INSERT INTO flood_thresholds (district, indicator, level, threshold_mm)
+      VALUES (?, ?, ?, ?)
+    `)
+    .run(district, indicator, level, thresholdMm);
+  return getThresholdById(info.lastInsertRowid);
+}
+
+function updateThreshold(id, { thresholdMm }) {
+  getDb()
+    .prepare(`
+      UPDATE flood_thresholds
+      SET threshold_mm = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `)
+    .run(thresholdMm, id);
+  return getThresholdById(id);
+}
+
+function deleteThreshold(id) {
+  return getDb().prepare('DELETE FROM flood_thresholds WHERE id = ?').run(id).changes > 0;
+}
+
+/** 获取所有阈值（内部计算用，返回原始行）。 */
+function getAllThresholdsRaw() {
+  return getDb().prepare('SELECT * FROM flood_thresholds').all();
+}
+
+/* --------------------------- 当前响应等级 --------------------------- */
+
+function mapResponseLevel(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    district: row.district,
+    currentLevel: row.current_level,
+    triggeredByIndicator: row.triggered_by_indicator,
+    triggeredValue: row.triggered_value,
+    calculatedAt: row.calculated_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function getResponseLevelByDistrict(district) {
+  return mapResponseLevel(
+    getDb().prepare('SELECT * FROM district_response_levels WHERE district = ?').get(district)
+  );
+}
+
+function getAllResponseLevels() {
+  return getDb()
+    .prepare('SELECT * FROM district_response_levels ORDER BY district')
+    .all()
+    .map(mapResponseLevel);
+}
+
+/**
+ * 更新区域响应等级，若等级变化则同时写入历史记录。
+ * 必须在事务内调用。
+ */
+function updateResponseLevelWithHistory(district, newLevel, triggeredBy, triggeredValue, calculatedAt) {
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM district_response_levels WHERE district = ?').get(district);
+
+  const oldLevel = existing ? existing.current_level : null;
+
+  if (oldLevel === newLevel && existing) {
+    db.prepare(`
+      UPDATE district_response_levels
+      SET calculated_at = ?, updated_at = datetime('now')
+      WHERE district = ?
+    `).run(calculatedAt, district);
+    return { level: newLevel, changed: false, oldLevel, newLevel };
+  }
+
+  if (existing) {
+    db.prepare(`
+      UPDATE district_response_levels
+      SET current_level = ?, triggered_by_indicator = ?, triggered_value = ?,
+          calculated_at = ?, updated_at = datetime('now')
+      WHERE district = ?
+    `).run(newLevel, triggeredBy, triggeredValue, calculatedAt, district);
+  } else {
+    db.prepare(`
+      INSERT INTO district_response_levels
+        (district, current_level, triggered_by_indicator, triggered_value, calculated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(district, newLevel, triggeredBy, triggeredValue, calculatedAt);
+  }
+
+  db.prepare(`
+    INSERT INTO level_change_history
+      (district, from_level, to_level, changed_at, triggered_by_indicator, triggered_value)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(district, oldLevel, newLevel, calculatedAt, triggeredBy, triggeredValue);
+
+  return { level: newLevel, changed: true, oldLevel, newLevel };
+}
+
+/* ----------------------------- 等级变更历史 ----------------------------- */
+
+function mapHistory(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    district: row.district,
+    fromLevel: row.from_level,
+    toLevel: row.to_level,
+    changedAt: row.changed_at,
+    triggeredByIndicator: row.triggered_by_indicator,
+    triggeredValue: row.triggered_value,
+  };
+}
+
+function getLevelHistory(district, { limit = 100 } = {}) {
+  return getDb()
+    .prepare(`
+      SELECT * FROM level_change_history
+      WHERE district = ?
+      ORDER BY id DESC
+      LIMIT ?
+    `)
+    .all(district, limit)
+    .map(mapHistory);
+}
+
+/* --------------------------------- 计数 --------------------------------- */
 
 function countUsers() {
   return getDb().prepare('SELECT COUNT(*) AS n FROM users').get().n;
@@ -280,4 +518,17 @@ module.exports = {
   createStation,
   updateStation,
   deleteStation,
+  batchUpsertRainfall,
+  getRainfallByRange,
+  getRainfallForCalculation,
+  listThresholds,
+  getThresholdById,
+  createThreshold,
+  updateThreshold,
+  deleteThreshold,
+  getAllThresholdsRaw,
+  getResponseLevelByDistrict,
+  getAllResponseLevels,
+  updateResponseLevelWithHistory,
+  getLevelHistory,
 };

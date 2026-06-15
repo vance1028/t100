@@ -7,6 +7,9 @@ const authRouter = require('./routes/auth');
 const usersRouter = require('./routes/users');
 const pipesRouter = require('./routes/pipes');
 const stationsRouter = require('./routes/stations');
+const thresholdsRouter = require('./routes/thresholds');
+const rainfallRouter = require('./routes/rainfall');
+const floodRouter = require('./routes/flood');
 const { sendError } = require('./utils/http');
 
 /**
@@ -33,6 +36,9 @@ function createApp() {
   app.use('/api/users', usersRouter);
   app.use('/api/pipes', pipesRouter);
   app.use('/api/stations', stationsRouter);
+  app.use('/api/thresholds', thresholdsRouter);
+  app.use('/api/rainfall', rainfallRouter);
+  app.use('/api/flood', floodRouter);
 
   // 404
   app.use((req, res) => {
